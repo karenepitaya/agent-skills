@@ -1,2 +1,3 @@
 .venv/
 scripts/_wx_profile/
+__pycache__/
