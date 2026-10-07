@@ -59,17 +59,9 @@ def fetch_article(url: str, headless: bool, timeout_ms: int, img_dir: Path):
                     ct: String(window.ct || ''),
                 };
             }""")
-            # 剔除非正文元素（赞赏弹窗/二维码弹窗/底部元信息栏），还原懒加载图片的真实地址
-            # 注意：.share_notice 在新模板里就是正文容器，不能删
+            # 还原懒加载图片的真实地址
             page.evaluate("""() => {
-                const root = document.querySelector('#js_content');
-                const junk = [
-                    '.wx_bottom_modal_wrp', '.reward_dialog', '[id^="reward-dialog"]',
-                    '#js_jump_wx_qrcode_dialog', '[class*="qrcode_dialog"]',
-                    '.rich_media_meta_list_combine',
-                ];
-                root.querySelectorAll(junk.join(',')).forEach(e => e.remove());
-                root.querySelectorAll('img').forEach(img => {
+                document.querySelectorAll('#js_content img').forEach(img => {
                     const ds = img.getAttribute('data-src');
                     if (ds) img.setAttribute('src', ds);
                     img.removeAttribute('data-src');
@@ -128,27 +120,6 @@ def download_images(srcs, img_dir: Path) -> dict:
     return mapping
 
 
-# 尾部推广区的标题特征（编辑手动加的推荐位，不是正文知识内容）
-PROMO_HEADING = re.compile(
-    r'^(今日|本周|近期)?好文推荐$|^(文章|阅读|好文|精彩|往期)推荐$|^推荐阅读$'
-    r'|^延伸阅读$|^(会议|活动|课程|直播)推荐$|^扫码.*(关注|报名)|^关注我们$')
-# 新版模板尾部的 IP 属地行，如 "广东,2026年10月2日 18:04"
-LOCATION_LINE = re.compile(r'^[一-龥]{2,4}\s*,\s*\d{4}年\d{1,2}月\d{1,2}日')
-
-
-def clean_body(body: str) -> str:
-    """裁掉正文末尾混入的推广区、属地行。只在文档后 40% 内匹配，避免误伤正文中的小标题。"""
-    lines = body.split('\n')
-    guard = int(len(lines) * 0.6)
-    for i, ln in enumerate(lines):
-        if i < guard:
-            continue
-        s = ln.strip().lstrip('#').strip().strip('*').strip()
-        if 0 < len(s) <= 25 and (PROMO_HEADING.search(s) or LOCATION_LINE.search(s)):
-            return '\n'.join(lines[:i]).rstrip()
-    return body
-
-
 def sanitize(name: str) -> str:
     return re.sub(r'[\\/:*?"<>|\r\n]+', '', name).strip()[:60] or "untitled"
 
@@ -173,7 +144,7 @@ def main():
         sys.exit("[x] 抓取失败：未获取到正文内容")
 
     meta, html = result
-    body = clean_body(md(html, heading_style="ATX", bullets="-").strip())
+    body = md(html, heading_style="ATX", bullets="-").strip()
     if len(body) < 200:
         sys.exit(f"[x] 正文提取异常：仅获取到 {len(body)} 字符，可能被软风控或模板变更，请用 --headed 检查页面")
 
