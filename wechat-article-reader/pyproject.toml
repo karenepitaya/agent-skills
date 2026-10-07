@@ -1,0 +1,10 @@
+[project]
+name = "wechat-article-reader"
+version = "0.1.0"
+description = "抓取微信公众号文章为本地 Markdown，使其对 agent 可读"
+requires-python = ">=3.11"
+dependencies = [
+    "markdownify>=1.1.0",
+    "playwright>=1.40.0",
+    "requests>=2.31.0",
+]
