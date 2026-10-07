@@ -26,8 +26,8 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 
 
-def fetch_article(url: str, headless: bool, timeout_ms: int):
-    """返回 (meta, 正文HTML)；被拦截或失败返回 None。"""
+def fetch_article(url: str, headless: bool, timeout_ms: int, img_dir: Path):
+    """返回 (meta, 正文HTML)；被拦截或失败返回 None。图片已下载到 img_dir 并改写为本地路径。"""
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(
             user_data_dir=str(PROFILE_DIR),
@@ -59,14 +59,34 @@ def fetch_article(url: str, headless: bool, timeout_ms: int):
                     ct: String(window.ct || ''),
                 };
             }""")
-            # 还原懒加载图片的真实地址
+            # 剔除非正文元素（赞赏弹窗/二维码弹窗/底部元信息栏），还原懒加载图片的真实地址
+            # 注意：.share_notice 在新模板里就是正文容器，不能删
             page.evaluate("""() => {
-                document.querySelectorAll('#js_content img').forEach(img => {
+                const root = document.querySelector('#js_content');
+                const junk = [
+                    '.wx_bottom_modal_wrp', '.reward_dialog', '[id^="reward-dialog"]',
+                    '#js_jump_wx_qrcode_dialog', '[class*="qrcode_dialog"]',
+                    '.rich_media_meta_list_combine',
+                ];
+                root.querySelectorAll(junk.join(',')).forEach(e => e.remove());
+                root.querySelectorAll('img').forEach(img => {
                     const ds = img.getAttribute('data-src');
                     if (ds) img.setAttribute('src', ds);
                     img.removeAttribute('data-src');
                 });
             }""")
+            # 图片本地化：通过 DOM 属性收集与改写，不用正则碰 HTML 字符串
+            # （正则会被 data-croporisrc 这类属性名截获，且处理不了 &amp; 实体编码）
+            srcs = page.evaluate(
+                "() => Array.from(document.querySelectorAll('#js_content img')).map(i => i.src)")
+            mapping = download_images(srcs, img_dir)
+            if mapping:
+                page.evaluate("""mapping => {
+                    document.querySelectorAll('#js_content img').forEach(img => {
+                        const local = mapping[img.src];
+                        if (local) img.setAttribute('src', local);
+                    });
+                }""", mapping)
             html = page.evaluate("() => document.querySelector('#js_content').innerHTML")
             return meta, html
         except Exception:
@@ -90,23 +110,43 @@ def guess_ext(src: str, content_type: str) -> str:
     return '.jpg'
 
 
-def localize_images(html: str, img_dir: Path) -> str:
-    """下载正文中的图片到本地并改写引用（微信图片有防盗链且会过期，必须本地化）。"""
-    srcs = sorted(set(re.findall(r'<img[^>]+?src="([^"]+)"', html)))
+def download_images(srcs, img_dir: Path) -> dict:
+    """下载正文图片到本地（微信图片有防盗链且会过期，必须本地化），返回 {远程URL: 本地相对路径}。"""
     headers = {"Referer": "https://mp.weixin.qq.com/", "User-Agent": UA}
-    for src in srcs:
+    mapping = {}
+    for src in sorted(set(srcs)):
         if not src.startswith("http"):
             continue
-        name = hashlib.md5(src.encode()).hexdigest()[:12]
         try:
             r = requests.get(src, headers=headers, timeout=30)
             r.raise_for_status()
-            fname = name + guess_ext(src, r.headers.get("Content-Type", ""))
+            fname = hashlib.md5(src.encode()).hexdigest()[:12] + guess_ext(src, r.headers.get("Content-Type", ""))
             (img_dir / fname).write_bytes(r.content)
-            html = html.replace(src, f"images/{fname}")
+            mapping[src] = f"images/{fname}"
         except Exception as e:
             print(f"  [warn] 图片下载失败 {src[:90]}: {e}")
-    return html
+    return mapping
+
+
+# 尾部推广区的标题特征（编辑手动加的推荐位，不是正文知识内容）
+PROMO_HEADING = re.compile(
+    r'^(今日|本周|近期)?好文推荐$|^(文章|阅读|好文|精彩|往期)推荐$|^推荐阅读$'
+    r'|^延伸阅读$|^(会议|活动|课程|直播)推荐$|^扫码.*(关注|报名)|^关注我们$')
+# 新版模板尾部的 IP 属地行，如 "广东,2026年10月2日 18:04"
+LOCATION_LINE = re.compile(r'^[一-龥]{2,4}\s*,\s*\d{4}年\d{1,2}月\d{1,2}日')
+
+
+def clean_body(body: str) -> str:
+    """裁掉正文末尾混入的推广区、属地行。只在文档后 40% 内匹配，避免误伤正文中的小标题。"""
+    lines = body.split('\n')
+    guard = int(len(lines) * 0.6)
+    for i, ln in enumerate(lines):
+        if i < guard:
+            continue
+        s = ln.strip().lstrip('#').strip().strip('*').strip()
+        if 0 < len(s) <= 25 and (PROMO_HEADING.search(s) or LOCATION_LINE.search(s)):
+            return '\n'.join(lines[:i]).rstrip()
+    return body
 
 
 def sanitize(name: str) -> str:
@@ -125,16 +165,17 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     img_dir.mkdir(exist_ok=True)
 
-    result = None if args.headed else fetch_article(args.url, headless=True, timeout_ms=15000)
+    result = None if args.headed else fetch_article(args.url, headless=True, timeout_ms=15000, img_dir=img_dir)
     if result is None:
         print("[*] 快速模式未取到正文（可能被风控），打开浏览器窗口，如需验证请手动完成...")
-        result = fetch_article(args.url, headless=False, timeout_ms=180000)
+        result = fetch_article(args.url, headless=False, timeout_ms=180000, img_dir=img_dir)
     if result is None:
         sys.exit("[x] 抓取失败：未获取到正文内容")
 
     meta, html = result
-    html = localize_images(html, img_dir)
-    body = md(html, heading_style="ATX", bullets="-").strip()
+    body = clean_body(md(html, heading_style="ATX", bullets="-").strip())
+    if len(body) < 200:
+        sys.exit(f"[x] 正文提取异常：仅获取到 {len(body)} 字符，可能被软风控或模板变更，请用 --headed 检查页面")
 
     pub = ""
     if meta["ct"].isdigit():
