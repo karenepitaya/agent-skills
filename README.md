@@ -5,19 +5,19 @@
 ## 目录结构
 
 ```
-skills/
-├── README.md            本文件，仓库规范
-├── AGENTS.md            agent 行为准则
-└── <skill-name>/
-    ├── SKILL.md         给 agent 看：触发时机和用法
-    ├── README.md        给人看：安装、排错、已知限制
-    └── scripts/         支撑脚本（如有）
+README.md                本文件，仓库规范
+AGENTS.md                指向 agent-constitution/SKILL.md，并写明本仓库工具链
+<skill-name>/
+├── SKILL.md             给 agent 看：触发时机和用法
+├── README.md            给人看：安装、排错、已知限制
+└── scripts/             支撑脚本（如有）
 ```
 
 ## Skill 清单
 
 | Skill | 作用 | 文档 |
 |-------|------|------|
+| agent-constitution | 编码 agent 的行为准则：核心常驻，场景文件按路由加载 | [SKILL](agent-constitution/SKILL.md) / [README](agent-constitution/README.md) |
 | wechat-article-reader | 抓取微信公众号文章为本地 Markdown，方便 agent 阅读 | [SKILL](wechat-article-reader/SKILL.md) / [README](wechat-article-reader/README.md) |
 
 ## 新增 Skill 规范
