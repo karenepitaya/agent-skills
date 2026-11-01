@@ -1,0 +1,36 @@
+# Clash Verge Config
+
+app_log_level: null
+app_log_max_size: 128
+app_log_max_count: 8
+language: zh
+theme_mode: system
+env_type: powershell
+traffic_graph: true
+enable_memory_usage: true
+enable_tun_mode: true
+enable_auto_launch: true
+enable_silent_start: false
+enable_system_proxy: true
+enable_proxy_guard: true
+enable_bypass_check: true
+enable_dns_settings: false
+use_default_bypass: true
+system_proxy_bypass: __SYSTEM_PROXY_BYPASS__
+proxy_guard_duration: 30
+proxy_auto_config: false
+proxy_host: 127.0.0.1
+clash_core: verge-mihomo
+enable_global_hotkey: true
+auto_close_connection: true
+auto_check_update: true
+enable_builtin_enhanced: true
+auto_log_clean: 2
+enable_auto_backup_schedule: false
+auto_backup_on_change: true
+verge_mixed_port: 7897
+verge_socks_port: 7898
+verge_socks_enabled: false
+verge_port: 7899
+verge_http_enabled: false
+enable_external_controller: false

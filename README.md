@@ -19,6 +19,7 @@ AGENTS.md                指向 agent-constitution/SKILL.md，并写明本仓库
 |-------|------|------|
 | agent-constitution | 编码 agent 的行为准则：核心常驻，场景文件按路由加载 | [SKILL](agent-constitution/SKILL.md) / [README](agent-constitution/README.md) |
 | wechat-article-reader | 抓取微信公众号文章为本地 Markdown，方便 agent 阅读 | [SKILL](wechat-article-reader/SKILL.md) / [README](wechat-article-reader/README.md) |
+| configuring-clash-proxy | 在新 Windows 电脑复现 Clash/Mihomo 分流环境，并按需配置 Tailscale 共存 | [SKILL](configuring-clash-proxy/SKILL.md) / [README](configuring-clash-proxy/README.md) |
 
 ## 新增 Skill 规范
 
