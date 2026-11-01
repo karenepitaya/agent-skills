@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 
-const [file, expected] = process.argv.slice(2);
+const [file, expected, expectedPort = '7897', expectedGroup = '节点选择', expectedDirectDomain = ''] = process.argv.slice(2);
 assert.ok(file, 'generated script path is required');
 assert.ok(expected === 'true' || expected === 'false', 'expected Tailscale state must be true or false');
 
@@ -17,4 +17,9 @@ const output = context.main({
 const actual = output.rules.includes('IP-CIDR,100.64.0.0/10,DIRECT,no-resolve');
 assert.equal(actual, expected === 'true', 'installer must render the detected Tailscale layer');
 assert.equal(output['proxy-groups'][0].proxies.includes('Node'), true);
+assert.equal(output['mixed-port'], Number(expectedPort));
+assert.equal(output['proxy-groups'][0].name, expectedGroup);
+if (expectedDirectDomain) {
+  assert.equal(output.rules.includes(`DOMAIN,${expectedDirectDomain},DIRECT`), true);
+}
 console.log(`generated profile executed with Tailscale=${actual}`);

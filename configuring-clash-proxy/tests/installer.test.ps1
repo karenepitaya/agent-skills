@@ -35,6 +35,7 @@ $portListener.Start()
 $port = ([Net.IPEndPoint]$portListener.LocalEndpoint).Port
 $portListener.Stop()
 $server = $null
+$testRegistryPath = $null
 
 try {
     $pythonArgs = @('-m', 'http.server', $port, '--bind', '127.0.0.1', '--directory', ('"{0}"' -f $webRoot))
@@ -68,22 +69,62 @@ try {
         (Test-Path -LiteralPath (Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe')) -or
         [bool](Get-Command 'tailscale.exe' -ErrorAction SilentlyContinue) -or [bool]$tailscaleRegistered
     $generated = Join-Path $configRoot 'profiles\portable-script.js'
-    & node (Join-Path $PSScriptRoot 'assert-generated.js') $generated ($tailscaleDetected.ToString().ToLowerInvariant())
+    & node (Join-Path $PSScriptRoot 'assert-generated.js') $generated false
     if ($LASTEXITCODE -ne 0) { throw 'generated profile behavior assertion failed' }
 
     $profilesPath = Join-Path $configRoot 'profiles.yaml'
     $coreConfigPath = Join-Path $configRoot 'config.yaml'
-    Assert-TextContains -Path $profilesPath -Expected 'update_interval: 3600' -Message 'remote profile must update hourly'
+    Assert-TextContains -Path $profilesPath -Expected 'update_interval: 60' -Message 'remote profile must update hourly'
     Assert-TextContains -Path $coreConfigPath -Expected 'stack: mips' -Message 'GUI-owned TUN stack must be mips'
     Assert-TextContains -Path $coreConfigPath -Expected 'strict-route: false' -Message 'GUI-owned strict-route must be false'
     if ([IO.File]::ReadAllText($coreConfigPath).Contains('route-exclude-address')) {
         throw 'GUI-owned config must not retain route-exclude-address'
     }
     $vergeConfigPath = Join-Path $configRoot 'verge.yaml'
+    Assert-TextContains -Path $vergeConfigPath -Expected 'system_proxy_bypass: null' -Message 'Tailscale bypass must be opt-in'
+
+    $customSettings = Get-Content -LiteralPath (Join-Path $skillRoot 'templates\settings.json') -Raw | ConvertFrom-Json
+    $customSettings.mixedPort = 17897
+    $customSettings.updateIntervalMinutes = 120
+    $customSettings.language = 'en'
+    $customSettings.systemProxy.enabled = $false
+    $customSettings.systemProxy.autoLaunch = $false
+    $customSettings.systemProxy.proxyGuard = $false
+    $customSettings.tun.enabled = $false
+    $customSettings.tun.stack = 'mixed'
+    $customSettings.proxyGroups.selectName = 'Proxy'
+    $customSettings.proxyGroups.autoName = 'Auto'
+    $customSettings.routing.directDomains = @('internal.example.com')
+    $customSettings.tailscale.enabled = $true
+    $customSettings.tailscale.bypassTsNet = $true
+    $customSettingsPath = Join-Path $testRoot 'custom-settings.json'
+    [IO.File]::WriteAllText($customSettingsPath, ($customSettings | ConvertTo-Json -Depth 20), (New-Object Text.UTF8Encoding($false)))
+    $customConfigRoot = Join-Path $testRoot 'custom config'
+    $testRegistryPath = 'HKCU:\Software\PortableProxyTests\' + [Guid]::NewGuid().ToString('N')
+    New-Item -Path $testRegistryPath -Force | Out-Null
+    Set-ItemProperty -Path $testRegistryPath -Name ProxyEnable -Value 1
+    Set-ItemProperty -Path $testRegistryPath -Name ProxyServer -Value 'existing-proxy:8080'
+    Set-ItemProperty -Path $testRegistryPath -Name ProxyOverride -Value 'existing-bypass'
+    Set-ItemProperty -Path $testRegistryPath -Name AutoConfigURL -Value 'https://proxy.example.com/existing.pac'
+    & $installer -SubscriptionUrl $url -ConfigRoot $customConfigRoot -SettingsPath $customSettingsPath -InternetSettingsPath $testRegistryPath -SkipInstall -SkipService -SkipStart -SkipTailscaleSetup
+    & node (Join-Path $PSScriptRoot 'assert-generated.js') (Join-Path $customConfigRoot 'profiles\portable-script.js') ($tailscaleDetected.ToString().ToLowerInvariant()) 17897 Proxy internal.example.com
+    if ($LASTEXITCODE -ne 0) { throw 'custom generated profile behavior assertion failed' }
+    Assert-TextContains -Path (Join-Path $customConfigRoot 'profiles.yaml') -Expected 'update_interval: 120' -Message 'custom update interval must be rendered in minutes'
+    $customVerge = Join-Path $customConfigRoot 'verge.yaml'
+    Assert-TextContains -Path $customVerge -Expected 'language: en' -Message 'custom UI language must be rendered'
+    Assert-TextContains -Path $customVerge -Expected 'enable_tun_mode: false' -Message 'custom TUN setting must be rendered'
+    Assert-TextContains -Path $customVerge -Expected 'enable_system_proxy: false' -Message 'custom system proxy setting must be rendered'
+    Assert-TextContains -Path $customVerge -Expected 'enable_auto_launch: false' -Message 'custom auto-launch setting must be rendered'
+    Assert-TextContains -Path $customVerge -Expected 'enable_proxy_guard: false' -Message 'custom proxy guard setting must be rendered'
     if ($tailscaleDetected) {
-        Assert-TextContains -Path $vergeConfigPath -Expected 'system_proxy_bypass: "*.ts.net"' -Message 'Tailscale layer must persist only the generic browser bypass'
+        Assert-TextContains -Path $customVerge -Expected 'system_proxy_bypass: "*.ts.net"' -Message 'explicit Tailscale bypass must be rendered'
     } else {
-        Assert-TextContains -Path $vergeConfigPath -Expected 'system_proxy_bypass: null' -Message 'base layer must keep the default proxy bypass'
+        Assert-TextContains -Path $customVerge -Expected 'system_proxy_bypass: null' -Message 'Tailscale bypass requires detection'
+    }
+    $preservedRegistry = Get-ItemProperty -Path $testRegistryPath
+    if ($preservedRegistry.ProxyEnable -ne 1 -or $preservedRegistry.ProxyServer -ne 'existing-proxy:8080' -or
+        $preservedRegistry.ProxyOverride -ne 'existing-bypass' -or $preservedRegistry.AutoConfigURL -ne 'https://proxy.example.com/existing.pac') {
+        throw 'disabled system proxy must not rewrite WinINet or remove PAC'
     }
 
     $statefulIndex = [IO.File]::ReadAllText($profilesPath, [Text.Encoding]::UTF8)
@@ -146,6 +187,7 @@ try {
     Write-Host 'Installer integration tests passed'
 } finally {
     Remove-Item Function:\Get-Process, Function:\Stop-Process, Function:\Start-Process -ErrorAction SilentlyContinue
+    if ($testRegistryPath) { Remove-Item -LiteralPath $testRegistryPath -Recurse -Force -ErrorAction SilentlyContinue }
     if ($server -and -not $server.HasExited) { Stop-Process -Id $server.Id -Force }
     if (Test-Path -LiteralPath $testRoot) { Remove-Item -LiteralPath $testRoot -Recurse -Force }
 }

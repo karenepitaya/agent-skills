@@ -1,5 +1,7 @@
 // Portable Clash Verge profile enhancement. ES5 only; rendered by Install-ClashProxy.ps1.
-var tailscaleEnabled = __TAILSCALE_ENABLED__;
+var settings = __SETTINGS__;
+var tailscaleDetected = __TAILSCALE_ENABLED__;
+var tailscaleEnabled = tailscaleDetected && settings.tailscale.enabled;
 
 function main(config, profileName) {
     if (!config.proxies || !config.proxies.length) {
@@ -14,28 +16,31 @@ function main(config, profileName) {
     for (i = 0; i < config.proxies.length; i++) {
         var proxy = config.proxies[i];
         if (!proxy || !proxy.name || seenNames[proxy.name]) continue;
-        if (proxy.name === '节点选择' || proxy.name === '自动选择' || proxy.name === 'DIRECT') {
+        if (proxy.name === settings.proxyGroups.selectName || proxy.name === settings.proxyGroups.autoName || proxy.name === 'DIRECT') {
             throw new Error('Subscription contains reserved proxy name: ' + proxy.name);
         }
         seenNames[proxy.name] = true;
         names.push(proxy.name);
         var server = String(proxy.server || '').replace(/^\[|\]$/g, '');
-        if (seenServers[server]) continue;
+        if (seenServers[server] || !settings.routing.directProxyServers) continue;
         if (/^(\d{1,3}\.){3}\d{1,3}$/.test(server)) {
             seenServers[server] = true;
             serverRules.push('IP-CIDR,' + server + '/32,DIRECT,no-resolve');
         } else if (server.indexOf(':') !== -1) {
             seenServers[server] = true;
             serverRules.push('IP-CIDR6,' + server + '/128,DIRECT,no-resolve');
+        } else if (server) {
+            seenServers[server] = true;
+            serverRules.push('DOMAIN,' + server + ',DIRECT');
         }
     }
     if (!names.length) throw new Error('Subscription has no inline proxies with usable names.');
 
-    config.mode = 'rule';
-    config['mixed-port'] = 7897;
-    config['allow-lan'] = false;
-    config['log-level'] = 'info';
-    config.ipv6 = true;
+    config.mode = settings.mode;
+    config['mixed-port'] = settings.mixedPort;
+    config['allow-lan'] = settings.allowLan;
+    config['log-level'] = settings.logLevel;
+    config.ipv6 = settings.ipv6;
     config['unified-delay'] = true;
     config['tcp-concurrent'] = true;
     config['find-process-mode'] = 'always';
@@ -48,25 +53,25 @@ function main(config, profileName) {
         mmdb: 'https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/country-lite.mmdb'
     };
     config.tun = {
-        enable: true,
-        stack: 'mips',
+        enable: settings.tun.enabled,
+        stack: settings.tun.stack,
         'auto-route': true,
-        'strict-route': false,
+        'strict-route': settings.tun.strictRoute,
         'auto-detect-interface': true,
         'dns-hijack': ['any:53']
     };
     config['proxy-groups'] = [
         {
-            name: '节点选择',
+            name: settings.proxyGroups.selectName,
             type: 'select',
-            proxies: ['自动选择'].concat(names, ['DIRECT'])
+            proxies: [settings.proxyGroups.autoName].concat(names, ['DIRECT'])
         },
         {
-            name: '自动选择',
+            name: settings.proxyGroups.autoName,
             type: 'url-test',
-            url: 'https://www.gstatic.com/generate_204',
-            interval: 300,
-            tolerance: 50,
+            url: settings.proxyGroups.urlTest,
+            interval: settings.proxyGroups.interval,
+            tolerance: settings.proxyGroups.tolerance,
             proxies: names
         }
     ];
@@ -86,7 +91,7 @@ function main(config, profileName) {
         ];
     }
 
-    var splitRules = [
+    var splitRules = settings.routing.useDefaultSplitRules ? [
         'GEOSITE,private,DIRECT',
         'GEOIP,private,DIRECT,no-resolve',
         'IP-CIDR,192.168.0.0/16,DIRECT,no-resolve',
@@ -174,28 +179,37 @@ function main(config, profileName) {
         'DOMAIN-SUFFIX,pinduoduo.com,DIRECT',
         'DOMAIN-SUFFIX,eastmoney.com,DIRECT',
         'GEOSITE,cn,DIRECT',
-        'GEOSITE,geolocation-!cn,节点选择',
-        'GEOIP,CN,DIRECT',
-        'MATCH,节点选择'
-    ];
-    config.rules = serverRules.concat(tailscaleRules, splitRules);
+        'GEOSITE,geolocation-!cn,' + settings.proxyGroups.selectName,
+        'GEOIP,CN,DIRECT'
+    ] : [];
+    config.rules = serverRules.concat(tailscaleRules, settings.routing.prependRules);
+    for (i = 0; i < settings.routing.directDomains.length; i++) {
+        config.rules.push('DOMAIN,' + settings.routing.directDomains[i] + ',DIRECT');
+    }
+    for (i = 0; i < settings.routing.proxyDomains.length; i++) {
+        config.rules.push('DOMAIN,' + settings.routing.proxyDomains[i] + ',' + settings.proxyGroups.selectName);
+    }
+    config.rules = config.rules.concat(splitRules, settings.routing.appendRules);
+    config.rules.push('MATCH,' + settings.proxyGroups.selectName);
 
     var filters = ['*.lan', '+.local', '+.msftconnecttest.com', '+.msftncsi.com'];
     if (tailscaleEnabled) filters = filters.concat(['+.ts.net', '+.tailscale.com', '+.tailscale.io']);
-    filters = filters.concat(['+.alidns.com', '+.doh.pub', 'dns.google']);
-    var policy = { 'geosite:cn': ['223.5.5.5', '119.29.29.29'] };
+    if (settings.routing.useDefaultSplitRules) filters = filters.concat(['+.alidns.com', '+.doh.pub', 'dns.google']);
+    filters = filters.concat(settings.dns.extraFakeIpFilters);
+    var policy = {};
+    if (settings.routing.useDefaultSplitRules) policy['geosite:cn'] = settings.dns.defaultNameservers;
     if (tailscaleEnabled) policy['+.ts.net'] = '100.100.100.100';
     config.dns = {
-        enable: true,
-        ipv6: true,
-        'enhanced-mode': 'fake-ip',
-        'fake-ip-range': '198.18.0.1/16',
+        enable: settings.dns.enabled,
+        ipv6: settings.dns.ipv6,
+        'enhanced-mode': settings.dns.enhancedMode,
+        'fake-ip-range': settings.dns.fakeIpRange,
         'fake-ip-filter': filters,
-        'default-nameserver': ['223.5.5.5', '119.29.29.29'],
-        'proxy-server-nameserver': ['223.5.5.5', '119.29.29.29'],
-        nameserver: ['https://1.1.1.1/dns-query', 'https://8.8.8.8/dns-query'],
+        'default-nameserver': settings.dns.defaultNameservers,
+        'proxy-server-nameserver': settings.dns.proxyServerNameservers,
+        nameserver: settings.dns.nameservers,
         'nameserver-policy': policy,
-        'fake-ip-range6': '2001:2::0/64'
+        'fake-ip-range6': settings.dns.fakeIpRange6
     };
     return config;
 }

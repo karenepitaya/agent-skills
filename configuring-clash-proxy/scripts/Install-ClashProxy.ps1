@@ -5,6 +5,8 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$SubscriptionUrl,
     [string]$ConfigRoot = (Join-Path $env:APPDATA 'io.github.clash-verge-rev.clash-verge-rev'),
+    [string]$SettingsPath,
+    [string]$InternetSettingsPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings',
     [switch]$SkipInstall,
     [switch]$SkipService,
     [switch]$SkipStart,
@@ -71,17 +73,24 @@ function Test-TailscaleInstalled {
         Select-Object -First 1)
 }
 
-function Enable-TailscaleDns {
+function Find-TailscaleExecutable {
     $executable = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
-    if (-not (Test-Path -LiteralPath $executable)) {
-        $command = Get-Command 'tailscale.exe' -ErrorAction SilentlyContinue
-        if ($command) { $executable = $command.Source }
-    }
-    if (-not $executable -or -not (Test-Path -LiteralPath $executable)) {
-        throw 'Tailscale was detected but tailscale.exe could not be located.'
-    }
-    & $executable set --accept-dns=true | Out-Host
-    if ($LASTEXITCODE -ne 0) { throw "Failed to enable Tailscale DNS (exit $LASTEXITCODE)." }
+    if (Test-Path -LiteralPath $executable) { return $executable }
+    $command = Get-Command 'tailscale.exe' -ErrorAction SilentlyContinue
+    if ($command) { return $command.Source }
+    throw 'Tailscale was detected but tailscale.exe could not be located.'
+}
+
+function Set-TailscaleDns {
+    param([bool]$Enabled)
+    $executable = Find-TailscaleExecutable
+    $preferences = & $executable debug prefs
+    if ($LASTEXITCODE -ne 0) { throw "Failed to read Tailscale DNS state (exit $LASTEXITCODE)." }
+    $previous = [bool]($preferences | ConvertFrom-Json).CorpDNS
+    $acceptDns = $Enabled.ToString().ToLowerInvariant()
+    & $executable set "--accept-dns=$acceptDns" | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw "Failed to set Tailscale DNS (exit $LASTEXITCODE)." }
+    return $previous
 }
 
 function Get-SubscriptionText {
@@ -93,7 +102,7 @@ function Get-SubscriptionText {
 
     $tempFile = [IO.Path]::GetTempFileName()
     try {
-        Invoke-WebRequest -Uri $uri.AbsoluteUri -OutFile $tempFile -UseBasicParsing -UserAgent 'clash-verge/v2.5.8' -TimeoutSec 60
+        Invoke-WebRequest -Uri $uri.AbsoluteUri -OutFile $tempFile -UseBasicParsing -UserAgent 'clash-verge/v2.5.8' -TimeoutSec 60 -NoProxy
         $text = [IO.File]::ReadAllText($tempFile, [Text.Encoding]::UTF8).TrimStart([char]0xFEFF)
         $proxyBlock = [regex]::Match($text, '(?ms)^proxies[ \t]*:[ \t]*(?<value>.*?)(?=^[A-Za-z_][A-Za-z0-9_-]*[ \t]*:|\z)')
         $hasBlockNodes = $proxyBlock.Success -and [regex]::IsMatch($proxyBlock.Groups['value'].Value, '(?m)^\s+-\s+')
@@ -174,9 +183,24 @@ if (-not $isAdmin -and (-not $SkipInstall -or -not $SkipService)) {
     throw 'Run this installer from an elevated Administrator PowerShell.'
 }
 
+if (-not $SettingsPath) { $SettingsPath = Join-Path $templateRoot 'settings.json' }
+$settings = Get-Content -LiteralPath $SettingsPath -Raw | ConvertFrom-Json
+if ($settings.mixedPort -lt 1 -or $settings.mixedPort -gt 65535) { throw 'mixedPort must be between 1 and 65535.' }
+if ($settings.mode -notin @('rule', 'global', 'direct')) { throw 'mode must be rule, global, or direct.' }
+if ($settings.updateIntervalMinutes -lt 0) { throw 'updateIntervalMinutes must be zero or greater.' }
+if (-not $settings.proxyGroups.selectName -or -not $settings.proxyGroups.autoName -or
+    $settings.proxyGroups.selectName -eq $settings.proxyGroups.autoName -or
+    $settings.proxyGroups.selectName -eq 'DIRECT' -or $settings.proxyGroups.autoName -eq 'DIRECT') {
+    throw 'Proxy group names must be nonempty, distinct, and not DIRECT.'
+}
+$settingsJson = $settings | ConvertTo-Json -Depth 20 -Compress
+
 $subscriptionText = Get-SubscriptionText -Url $SubscriptionUrl
 $tailscaleDetected = Test-TailscaleInstalled
-if ($tailscaleDetected -and -not $SkipTailscaleSetup) { Enable-TailscaleDns }
+$previousTailscaleDns = $null
+if ($tailscaleDetected -and $settings.tailscale.enabled -and $settings.tailscale.acceptDns -and -not $SkipTailscaleSetup) {
+    $previousTailscaleDns = Set-TailscaleDns -Enabled $true
+}
 $clashExe = Find-ClashVerge
 if (-not $clashExe -and -not $SkipInstall) {
     $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
@@ -209,6 +233,7 @@ foreach ($relative in $managedRelativePaths) {
     Backup-ManagedFile -Path (Join-Path $ConfigRoot $relative) -BackupRoot $backupRoot -RelativePath $relative
 }
 $profileState = Get-PreservedProfileState -Path (Join-Path $ConfigRoot 'profiles.yaml') -SubscriptionUrl $SubscriptionUrl
+$previousInternetSettings = $null
 
 try {
     if (-not $SkipStart) {
@@ -219,15 +244,23 @@ try {
 
     $profileTemplate = [IO.File]::ReadAllText((Join-Path $templateRoot 'profile.js'), [Text.Encoding]::UTF8)
     $tailscaleLiteral = if ($tailscaleDetected) { 'true' } else { 'false' }
-    $renderedProfile = $profileTemplate.Replace('__TAILSCALE_ENABLED__', $tailscaleLiteral)
+    $renderedProfile = $profileTemplate.Replace('__TAILSCALE_ENABLED__', $tailscaleLiteral).Replace('__SETTINGS__', $settingsJson)
+    $bypassEntries = @($settings.systemProxy.additionalBypass)
+    if ($tailscaleDetected -and $settings.tailscale.enabled -and $settings.tailscale.bypassTsNet) { $bypassEntries += '*.ts.net' }
+    $systemProxyBypass = if ($bypassEntries.Count) { '"' + ($bypassEntries -join ';') + '"' } else { 'null' }
+    $tunEnabled = $settings.tun.enabled.ToString().ToLowerInvariant()
+    $systemProxyEnabled = $settings.systemProxy.enabled.ToString().ToLowerInvariant()
+    $autoLaunch = $settings.systemProxy.autoLaunch.ToString().ToLowerInvariant()
+    $proxyGuard = $settings.systemProxy.proxyGuard.ToString().ToLowerInvariant()
     $vergeTemplate = [IO.File]::ReadAllText((Join-Path $templateRoot 'verge.yaml'), [Text.Encoding]::UTF8)
-    $systemProxyBypass = 'null'
-    if ($tailscaleDetected) { $systemProxyBypass = '"*.ts.net"' }
-    $vergeTemplate = $vergeTemplate.Replace('__SYSTEM_PROXY_BYPASS__', $systemProxyBypass)
+    $vergeTemplate = $vergeTemplate.Replace('__LANGUAGE__', [string]$settings.language).Replace('__TUN_ENABLED__', $tunEnabled).Replace('__AUTO_LAUNCH__', $autoLaunch).Replace('__SYSTEM_PROXY_ENABLED__', $systemProxyEnabled).Replace('__PROXY_GUARD__', $proxyGuard).Replace('__MIXED_PORT__', [string]$settings.mixedPort).Replace('__SYSTEM_PROXY_BYPASS__', $systemProxyBypass)
     $coreTemplate = [IO.File]::ReadAllText((Join-Path $templateRoot 'config.yaml'), [Text.Encoding]::UTF8)
+    $coreTemplate = $coreTemplate.Replace('__MIXED_PORT__', [string]$settings.mixedPort).Replace('__LOG_LEVEL__', [string]$settings.logLevel).Replace('__ALLOW_LAN__', $settings.allowLan.ToString().ToLowerInvariant()).Replace('__IPV6__', $settings.ipv6.ToString().ToLowerInvariant()).Replace('__MODE__', [string]$settings.mode).Replace('__TUN_ENABLED__', $tunEnabled).Replace('__TUN_STACK__', [string]$settings.tun.stack).Replace('__STRICT_ROUTE__', $settings.tun.strictRoute.ToString().ToLowerInvariant())
     $mergeTemplate = [IO.File]::ReadAllText((Join-Path $templateRoot 'merge.yaml'), [Text.Encoding]::UTF8)
     $escapedUrl = $SubscriptionUrl.Replace("'", "''")
     $updated = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $autoUpdate = ($settings.updateIntervalMinutes -gt 0).ToString().ToLowerInvariant()
+    $updateInterval = $settings.updateIntervalMinutes
     $preservedItems = $profileState.Items
     $selectedBlock = $profileState.Selected
     $profilesIndex = @"
@@ -252,8 +285,8 @@ ${preservedItems}- uid: portable-merge
   url: '$escapedUrl'
 $selectedBlock  updated: $updated
   option:
-    allow_auto_update: true
-    update_interval: 3600
+    allow_auto_update: $autoUpdate
+    update_interval: $updateInterval
     merge: portable-merge
     script: portable-script
 "@
@@ -267,17 +300,19 @@ $selectedBlock  updated: $updated
 
     if (-not $SkipStart) {
         Start-Process -FilePath $clashExe
-        if (-not (Wait-ProxyPort -HostName '127.0.0.1' -Port 7897 -TimeoutSeconds $StartupTimeoutSeconds)) {
-            throw "Clash Verge started but 127.0.0.1:7897 is not listening. Check $ConfigRoot\logs."
+        if (-not (Wait-ProxyPort -HostName '127.0.0.1' -Port $settings.mixedPort -TimeoutSeconds $StartupTimeoutSeconds)) {
+            throw "Clash Verge started but 127.0.0.1:$($settings.mixedPort) is not listening. Check $ConfigRoot\logs."
         }
     }
 
-    if (-not $SkipSystemProxy) {
-        $internetSettings = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
-        Set-ItemProperty -Path $internetSettings -Name ProxyEnable -Type DWord -Value 1
-        Set-ItemProperty -Path $internetSettings -Name ProxyServer -Value '127.0.0.1:7897'
+    if (-not $SkipSystemProxy -and $settings.systemProxy.enabled) {
+        $internetSettings = $InternetSettingsPath
+        $previousInternetSettings = Get-ItemProperty -Path $internetSettings
+        $proxyEnableValue = if ($settings.systemProxy.enabled) { 1 } else { 0 }
+        Set-ItemProperty -Path $internetSettings -Name ProxyEnable -Type DWord -Value $proxyEnableValue
+        Set-ItemProperty -Path $internetSettings -Name ProxyServer -Value "127.0.0.1:$($settings.mixedPort)"
         $proxyOverride = ';localhost.*;;localhost;127.*;192.168.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;<local>'
-        if ($tailscaleDetected) { $proxyOverride += ';*.ts.net' }
+        foreach ($entry in $bypassEntries) { $proxyOverride += ';' + $entry }
         Set-ItemProperty -Path $internetSettings -Name ProxyOverride -Value $proxyOverride
         Remove-ItemProperty -Path $internetSettings -Name AutoConfigURL -ErrorAction SilentlyContinue
         if (-not ('PortableProxy.WinInet' -as [type])) {
@@ -299,6 +334,21 @@ namespace PortableProxy {
     if (-not $SkipStart) {
         Get-Process -Name 'clash-verge', 'verge-mihomo', 'verge-mihomo-alpha' -ErrorAction SilentlyContinue | Stop-Process -Force
     }
+    if ($null -ne $previousTailscaleDns -and -not $previousTailscaleDns) {
+        Set-TailscaleDns -Enabled $false | Out-Null
+    }
+    if ($previousInternetSettings) {
+        Set-ItemProperty -Path $InternetSettingsPath -Name ProxyEnable -Value $previousInternetSettings.ProxyEnable
+        Set-ItemProperty -Path $InternetSettingsPath -Name ProxyServer -Value $previousInternetSettings.ProxyServer
+        Set-ItemProperty -Path $InternetSettingsPath -Name ProxyOverride -Value $previousInternetSettings.ProxyOverride
+        if ($previousInternetSettings.PSObject.Properties['AutoConfigURL']) {
+            Set-ItemProperty -Path $InternetSettingsPath -Name AutoConfigURL -Value $previousInternetSettings.AutoConfigURL
+        } else {
+            Remove-ItemProperty -Path $InternetSettingsPath -Name AutoConfigURL -ErrorAction SilentlyContinue
+        }
+        [void][PortableProxy.WinInet]::InternetSetOption([IntPtr]::Zero, 39, [IntPtr]::Zero, 0)
+        [void][PortableProxy.WinInet]::InternetSetOption([IntPtr]::Zero, 37, [IntPtr]::Zero, 0)
+    }
     foreach ($relative in $managedRelativePaths) {
         Restore-ManagedFile -Path (Join-Path $ConfigRoot $relative) -BackupRoot $backupRoot -RelativePath $relative
     }
@@ -306,5 +356,5 @@ namespace PortableProxy {
 }
 
 Write-Host "Portable Clash configuration written to $ConfigRoot"
-Write-Host "Tailscale layer: $tailscaleDetected"
+Write-Host "Tailscale detected: $tailscaleDetected; layer enabled: $($tailscaleDetected -and $settings.tailscale.enabled)"
 if (Test-Path -LiteralPath $backupRoot) { Write-Host "Previous managed files backed up to $backupRoot" }
